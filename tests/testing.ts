@@ -2,12 +2,37 @@ import * as anchor from "@coral-xyz/anchor";
 import { CreateToken } from "../target/types/create_token";
 import { Keypair } from "@solana/web3.js";
 import { getAssociatedTokenAddressSync } from "@solana/spl-token";
+import { PublicKey, SystemProgram } from "@solana/web3.js";
+import { assert } from "chai";
 
 describe("SPL Token Minter", () => {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
   const payer = provider.wallet as anchor.Wallet;
   const program = anchor.workspace.CreateToken as anchor.Program<CreateToken>;
+
+
+  let devwallet: PublicKey;
+  let devwalletBump: number;
+  let mintAccount: anchor.web3.Keypair;
+  let devTokenAccount: anchor.web3.PublicKey;
+
+  before(async () => {
+      // Derive devwallet PDA
+      [devwallet, devwalletBump] = PublicKey.findProgramAddressSync(
+        [Buffer.from("DEV_WALLET"), provider.wallet.publicKey.toBuffer()],
+        program.programId
+      );
+
+      // Initialize mint account
+      mintAccount = anchor.web3.Keypair.generate();
+
+      // Create the associated token account for the dev wallet
+      devTokenAccount = getAssociatedTokenAddressSync(
+        mintKeypair.publicKey,
+        programUsdtVault
+      );
+  });
 
   const metadata = {
     decimals: 6,
@@ -22,6 +47,26 @@ describe("SPL Token Minter", () => {
 
   // Define the public key of the USDT vault
   const programUsdtVault = new anchor.web3.PublicKey("EV62byYdsPq9W7nR8TL2JtX5EVDrLwWmXYuMjttahbdJ");
+
+
+  it("Creates a devwallet", async () => {
+    await program.methods
+      .create()
+      .accounts({
+        devwallet,
+        dev: provider.wallet.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([provider.wallet])
+      .rpc();
+
+    const devwalletAccount = await program.account.devwallet.fetch(devwallet);
+    assert.equal(
+      devwalletAccount.admin.toBase58(),
+      provider.wallet.publicKey.toBase58(),
+      "Dev wallet admin should be the provider wallet"
+    );
+  });
 
   it("Create an SPL Token!", async () => {
     const transactionSignature = await program.methods
@@ -52,11 +97,12 @@ describe("SPL Token Minter", () => {
 
     // Mint the tokens directly to the USDT vault's associated token account.
     const transactionSignature = await program.methods
-      .mintToken(amount)
+      .buyToken(amount)
       .accounts({
         mintAuthority: payer.publicKey,
         recipient: programUsdtVault, // Use the vault public key here
         mintAccount: mintKeypair.publicKey,
+        // @ts-ignore
         associatedTokenAccount: usdtVaultTokenAccountAddress,
       })
       .rpc();
@@ -65,6 +111,83 @@ describe("SPL Token Minter", () => {
     console.log(`   USDT Vault Token Account Address: ${usdtVaultTokenAccountAddress}`);
     console.log(`   Transaction Signature: ${transactionSignature}`);
   });
+
+  it("Burns tokens from the dev wallet's associated token account", async () => {
+    const burnAmount = new anchor.BN(5 * 10 ** 6); // e.g., 5 tokens
+
+    await program.methods
+      .sellToken(burnAmount)
+      .accounts({
+        authority: provider.wallet.publicKey,
+        devwallet,
+        devWalletTokenAccount: devTokenAccount,
+        mint: mintAccount.publicKey,
+        tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+      })
+      .signers([])
+      .rpc();
+
+    const devTokenBalance = await provider.connection.getTokenAccountBalance(
+      devTokenAccount
+    );
+    assert.equal(
+      devTokenBalance.value.amount,
+      (5 * 10 ** 6).toString(),
+      "The dev wallet should have the correct balance after burning tokens"
+    );
+  });
+
+
+  it("Transfers tokens from one wallet to another", async () => {
+    // Generate recipient token account
+    const recipientWallet = anchor.web3.Keypair.generate();
+    const recipientTokenAccount = await anchor.utils.token.associatedAddress({
+      mint: mintAccount.publicKey,
+      owner: recipientWallet.publicKey,
+    });
+
+    // Fund recipient's wallet to pay for account creation
+    await provider.connection.confirmTransaction(
+      await provider.connection.requestAirdrop(
+        recipientWallet.publicKey,
+        anchor.web3.LAMPORTS_PER_SOL
+      )
+    );
+
+    // Create recipient token account
+    await provider.methods.createAssociatedTokenAccount({
+      mint: mintAccount.publicKey,
+      owner: recipientWallet.publicKey,
+    });
+
+    const transferAmount = new anchor.BN(2 * 10 ** 6); // e.g., 2 tokens
+
+    await program.methods
+      .transferToken(transferAmount)
+      .accounts({
+        authority: provider.wallet.publicKey,
+        from: devTokenAccount,
+        to: recipientTokenAccount,
+        mint: mintAccount.publicKey,
+        tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+      })
+      .signers([])
+      .rpc();
+
+    const recipientTokenBalance = await provider.connection.getTokenAccountBalance(
+      recipientTokenAccount
+    );
+    assert.equal(
+      recipientTokenBalance.value.amount,
+      transferAmount.toString(),
+      "Recipient should receive the transferred tokens"
+    );
+  });
+
+
+
+
+
 });
 
 
