@@ -9,10 +9,13 @@ use {
         // token::{Mint, Token}, 
     },
 };
-use anchor_spl::token::{ Mint, Burn, burn, Token, transfer, TokenAccount, MintTo, mint_to};
+use anchor_spl::token::{ self, Mint, Burn, burn, Token, transfer, TokenAccount, MintTo, mint_to};
 use anchor_spl::associated_token::AssociatedToken; 
 
-declare_id!("DsZK9at5qHE4dG5ezQaaZHjMYFGA43yzteX5gc9revH5");
+declare_id!("68q1Mqr4poSokqbcgS2P6exAWomAMdYZmxxui4yjndoK");
+
+const CUSTOM_USDT_MINT: &str = "GYNdve5Wdj38wpVTwwdaPZ6YhdygR5z4La34fRkxcB6C";
+
 
 #[program]
 pub mod create_token {
@@ -20,9 +23,24 @@ pub mod create_token {
 
     pub fn create(ctx: Context<Create>) -> Result<()> {
         let devwallet = &mut ctx.accounts.devwallet;
+        devwallet.amount_donated = 0;
         devwallet.admin = *ctx.accounts.dev.key;
         Ok(())
     }
+
+
+    // The whitelist_wallet function using the new update_whitelist method
+    pub fn whitelist_wallet(ctx: Context<Whitelist>, wallet: Pubkey, authorized: bool) -> Result<()> {
+    let devwallet = &mut ctx.accounts.devwallet;
+
+    // Check if the signer is the admin
+    require!(devwallet.admin == *ctx.accounts.signer.key, CFError::WrongUser);
+
+    // Update the whitelist
+    devwallet.update_whitelist(wallet, authorized);
+
+    Ok(())
+}
 
     pub fn create_token_mint(
         ctx: Context<CreateTokenMint>,
@@ -144,6 +162,108 @@ pub mod create_token {
     
         Ok(())
     }
+
+    pub fn swap_sol(
+        ctx: Context<Swap>,
+        _program_custom_token_vault_bump: u8,
+        sol_amount: u64,
+        // _vault_bump: u8,
+    ) -> Result<()> {
+
+    
+        // Convert SOL amount to u128 for precision
+        let sol_amount_u128 = sol_amount as u128;
+        let sol_usdt_price: u128 = 149_00;
+
+    
+        // Adjust for SOL decimals (9 decimals for SOL tokens)
+        // Calculate the USDT amount, adjusting for SOL decimals (9 decimals for SOL tokens)
+        let usdt_amount = sol_amount_u128
+            .checked_mul(sol_usdt_price) // Multiply SOL amount by the price
+            .unwrap()
+            .checked_div(1_000_000_000)  // Adjust for SOL decimals
+            .unwrap() as u64;
+
+            // transfer sol from user to admin
+            let ix = anchor_lang::solana_program::system_instruction::transfer(
+                &ctx.accounts.user.key(),
+                &ctx.accounts.devwallet.key(),
+                sol_amount,
+            );
+            anchor_lang::solana_program::program::invoke(
+                &ix,
+                &[
+                    ctx.accounts.user.to_account_info(),
+                    ctx.accounts.devwallet.to_account_info(),
+                ],
+            )?;
+            (&mut ctx.accounts.devwallet).amount_donated += sol_amount;
+            msg!("transfer {} sol to admin.", sol_amount);
+
+        // transfer ICO from program to user ATA
+        // let ico_amount = sol_amount * ctx.accounts.data.sol;
+        let ico_mint_address = ctx.accounts.custom_token_mint.key();
+        let seeds = &[ico_mint_address.as_ref(), &[_program_custom_token_vault_bump]];
+        let signer = [&seeds[..]];
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            token::Transfer {
+                from: ctx.accounts.ico_ata_for_ico_program.to_account_info(),
+                to: ctx.accounts.user_custom_token_account.to_account_info(),
+                authority: ctx.accounts.ico_ata_for_ico_program.to_account_info(),
+            },
+            &signer,
+        );
+        token::transfer(cpi_ctx, usdt_amount)?;
+        msg!("transfer {} ico to buyer/user.", usdt_amount);
+        Ok(())
+    }
+
+
+
+    pub fn swap_usdt(
+        ctx: Context<Swap>,
+        // _ico_ata_for_ico_program_bump: u8,
+        usdt_amount: u64
+        // _vault_bump: u8,
+    ) -> Result<()> {
+        
+        let sol_usdc_price: u128 = 149_00;  // 149.00 USDC, stored as 14900
+
+        // // Convert USDC amount to u128 for precision
+        let usdc_amount_u128 = usdt_amount as u128;
+        
+        // // Adjust for SOL decimals (9 decimals for SOL tokens)
+        let sol_amount = usdc_amount_u128
+        .checked_mul(1_000_000_000)  // Adjust for SOL decimals
+            .unwrap()
+            .checked_div(sol_usdc_price)
+            .unwrap() as u64;
+        
+        // transfer ICO user to program ata
+        let cpi_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            token::Transfer {
+                from: ctx.accounts.user_custom_token_account.to_account_info(),
+                to: ctx.accounts.ico_ata_for_ico_program.to_account_info(),
+                authority: ctx.accounts.user.to_account_info(),
+            },
+        );
+        token::transfer(cpi_ctx, usdt_amount)?;
+        msg!("transfer {} ico to buyer/user.", usdt_amount);
+
+        let devwallet = &mut ctx.accounts.devwallet;
+        let user = &mut ctx.accounts.user;
+
+        **devwallet.to_account_info().try_borrow_mut_lamports()? -= sol_amount;
+        **user.to_account_info().try_borrow_mut_lamports()? += sol_amount;
+  
+        (&mut ctx.accounts.devwallet).amount_donated -= sol_amount;
+        msg!("transfer {} sol to admin.", sol_amount);
+
+        Ok(())
+    }
+    
     
 
 }
@@ -153,9 +273,27 @@ pub mod create_token {
 pub struct Create<'info> {
     #[account(init, payer=dev, space=9000, seeds=[b"DEV_WALLET".as_ref(), dev.key().as_ref()], bump)]
     pub devwallet: Account<'info, Devwallet>,
+
+    #[account(
+    init,
+    payer = dev,
+    seeds = [ CUSTOM_USDT_MINT.parse::<Pubkey>().unwrap().as_ref() ],
+    bump,
+    token::mint = custom_token_mint,
+    token::authority = program_custom_token_vault,
+    )]
+    pub program_custom_token_vault: Account<'info, TokenAccount>,
+
+    #[account(
+        address = CUSTOM_USDT_MINT.parse::<Pubkey>().unwrap(),
+    )]
+    pub custom_token_mint: Account<'info, Mint>,
+
     #[account(mut)]
     pub dev: Signer<'info>,
     pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+    pub rent: Sysvar<'info, Rent>,
 }
 
 #[derive(Accounts)]
@@ -227,6 +365,21 @@ pub struct SellToken<'info> {
 }
 
 
+// #[derive(Accounts)]
+// pub struct Whitelist<'info> {
+//     #[account(mut)]
+//     pub devwallet: Account<'info, Devwallet>,
+//     pub signer: Signer<'info>,
+// }
+
+#[derive(Accounts)]
+pub struct Whitelist<'info> {
+    #[account(mut)]
+    pub devwallet: Account<'info, Devwallet>,
+    #[account(mut)]
+    pub signer: Signer<'info>,
+}
+
 #[derive(Accounts)]
 pub struct TransferToken<'info> {
     #[account(mut)]
@@ -244,9 +397,72 @@ pub struct TransferToken<'info> {
 }
 
 
+#[derive(Accounts)]
+#[instruction(_program_custom_token_vault_bump: u8)]
+pub struct Swap<'info> {
+    #[account(
+    mut,
+    seeds = [ custom_token_mint.key().as_ref() ],
+    bump = _program_custom_token_vault_bump,
+    )]
+    pub ico_ata_for_ico_program: Account<'info, TokenAccount>,
+
+    // #[account(
+    //     mut,
+    //     seeds = [b"VAULT_DEMO".as_ref()],  // Use the same seed
+    //     bump = _vault_bump  // Validate the bump matches
+    // )]
+    // pub vault: Account<'info, Vault>,
+    #[account(mut)]
+    pub devwallet: Account<'info, Devwallet>,
+    
+
+    #[account(
+    address = CUSTOM_USDT_MINT.parse::<Pubkey>().unwrap(),
+    )]
+    pub custom_token_mint: Account<'info, Mint>,
+
+    #[account(mut)]
+    pub user_custom_token_account: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    /// CHECK:
+    #[account(mut)]
+    pub admin: AccountInfo<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+
+
+
+
 #[account]
 pub struct Devwallet {
     pub admin: Pubkey,
+    pub whitelist: Vec<(Pubkey, bool)>, // Using Vec as a substitute for HashMap
+    pub amount_donated: u64,
+}
+
+
+
+
+impl Devwallet {
+    // Helper method to update the whitelist Vec
+    pub fn update_whitelist(&mut self, wallet: Pubkey, authorized: bool) {
+        // Check if wallet is already in the whitelist
+        for (key, value) in self.whitelist.iter_mut() {
+            if *key == wallet {
+                *value = authorized;
+                return;
+            }
+        }
+        // If wallet not found, insert as a new entry
+        self.whitelist.push((wallet, authorized));
+    }
 }
 
 
